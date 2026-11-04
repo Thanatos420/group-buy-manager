@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-Group Buy Manager - Simple version
-Easy daily use
+Group Buy Manager - Simple & stable version
 """
 
 import streamlit as st
@@ -22,7 +21,12 @@ def get_conn():
 def init_db():
     conn = get_conn()
     c = conn.cursor()
-    c.execute("""CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)""")
+
+    c.execute("""CREATE TABLE IF NOT EXISTS settings (
+        key TEXT PRIMARY KEY,
+        value TEXT
+    )""")
+
     c.execute("""CREATE TABLE IF NOT EXISTS buyers (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT NOT NULL,
@@ -31,6 +35,7 @@ def init_db():
         typical_lbs REAL DEFAULT 1.0,
         notes TEXT
     )""")
+
     c.execute("""CREATE TABLE IF NOT EXISTS cycles (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT,
@@ -39,6 +44,7 @@ def init_db():
         wholesale_price REAL,
         sell_price REAL
     )""")
+
     c.execute("""CREATE TABLE IF NOT EXISTS commitments (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         cycle_id INTEGER,
@@ -46,11 +52,14 @@ def init_db():
         lbs REAL,
         amount_due REAL,
         amount_paid REAL DEFAULT 0,
-        paid INTEGER DEFAULT 0
+        payment_status TEXT DEFAULT 'Pending'
     )""")
+
+    # Safe defaults
     c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('wholesale_price', ?)", (str(DEFAULT_WHOLESALE),))
     c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('sell_price', ?)", (str(DEFAULT_SELL),))
     c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('reinvestment_fund', '0')")
+
     conn.commit()
     conn.close()
 
@@ -91,14 +100,13 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# Simple top nav
 page = st.radio("", ["Drop", "People", "History", "Settings"], horizontal=True, label_visibility="collapsed")
 
 wholesale = float(get_setting("wholesale_price", DEFAULT_WHOLESALE))
 sell = float(get_setting("sell_price", DEFAULT_SELL))
 
 # ══════════════════════════════════════════════
-# DROP (main daily screen)
+# DROP
 # ══════════════════════════════════════════════
 if page == "Drop":
     st.title("Current Drop")
@@ -108,7 +116,6 @@ if page == "Drop":
         "SELECT * FROM cycles WHERE status != 'Closed' ORDER BY id DESC LIMIT 1"
     ).fetchone()
 
-    # No open drop → create one fast
     if not cycle:
         st.info("No open drop yet")
         if st.button(f"Start {month_name()}", use_container_width=True, type="primary"):
@@ -121,8 +128,7 @@ if page == "Drop":
         conn.close()
         st.stop()
 
-    # Show current drop
-    st.subheader(cycle["name"])
+    st.subheader(cycle["name"] or "Drop")
     st.caption(f"Status: {cycle['status']}  ·  ${cycle['sell_price']:.0f}/lb")
 
     stats = conn.execute("""
@@ -144,7 +150,6 @@ if page == "Drop":
 
     st.divider()
 
-    # Quick add person
     st.markdown("**Add someone**")
     buyers = conn.execute("SELECT id, name, typical_lbs FROM buyers ORDER BY name").fetchall()
 
@@ -161,43 +166,46 @@ if page == "Drop":
             if st.form_submit_button("Add to drop", use_container_width=True, type="primary"):
                 b = bmap[name]
                 paid_amt = amount if already_paid else 0.0
+                status = "Paid" if already_paid else "Pending"
                 conn.execute(
-                    "INSERT INTO commitments (cycle_id, buyer_id, lbs, amount_due, amount_paid, paid) VALUES (?,?,?,?,?,?)",
-                    (cycle["id"], b["id"], lbs, amount, paid_amt, 1 if already_paid else 0)
+                    "INSERT INTO commitments (cycle_id, buyer_id, lbs, amount_due, amount_paid, payment_status) VALUES (?,?,?,?,?,?)",
+                    (cycle["id"], b["id"], lbs, amount, paid_amt, status)
                 )
                 conn.commit()
                 st.success("Added")
                 st.rerun()
 
-    # Who is in this drop
-    commits = pd.read_sql_query("""
-        SELECT cm.id, b.name, cm.lbs, cm.amount_due, cm.amount_paid, cm.paid
-        FROM commitments cm
-        JOIN buyers b ON b.id = cm.buyer_id
-        WHERE cm.cycle_id = ?
-        ORDER BY cm.paid ASC, b.name
-    """, conn, params=(cycle["id"],))
+    # List people in this drop
+    try:
+        commits = pd.read_sql_query("""
+            SELECT cm.id, b.name, cm.lbs, cm.amount_due, cm.amount_paid, cm.payment_status
+            FROM commitments cm
+            JOIN buyers b ON b.id = cm.buyer_id
+            WHERE cm.cycle_id = ?
+            ORDER BY CASE WHEN cm.payment_status = 'Paid' THEN 1 ELSE 0 END, b.name
+        """, conn, params=(cycle["id"],))
+    except Exception:
+        commits = pd.DataFrame()
 
     if not commits.empty:
         st.markdown("**In this drop**")
         for _, row in commits.iterrows():
-            status = "✅" if row["paid"] else "⏳"
+            is_paid = str(row.get("payment_status", "")).lower() == "paid" or float(row.get("amount_paid", 0) or 0) >= float(row.get("amount_due", 0) or 0)
+            status = "✅" if is_paid else "⏳"
             col1, col2 = st.columns([3, 1])
             with col1:
                 st.write(f"{status} **{row['name']}** — {row['lbs']} lb — ${row['amount_due']:.0f}")
             with col2:
-                if not row["paid"]:
+                if not is_paid:
                     if st.button("Mark paid", key=f"pay_{row['id']}", use_container_width=True):
                         conn.execute(
-                            "UPDATE commitments SET amount_paid=?, paid=1 WHERE id=?",
+                            "UPDATE commitments SET amount_paid=?, payment_status='Paid' WHERE id=?",
                             (row["amount_due"], row["id"])
                         )
                         conn.commit()
                         st.rerun()
 
     st.divider()
-
-    # Status controls
     st.markdown("**Drop controls**")
     sc1, sc2 = st.columns(2)
     with sc1:
@@ -243,13 +251,16 @@ elif page == "People":
 
     with tab_list:
         conn = get_conn()
-        people = pd.read_sql_query(
-            "SELECT name, typical_lbs, contact, status FROM buyers ORDER BY name", conn
-        )
-        if people.empty:
-            st.write("No one added yet")
-        else:
-            st.dataframe(people, use_container_width=True, hide_index=True)
+        try:
+            people = pd.read_sql_query(
+                "SELECT name, typical_lbs, contact, status FROM buyers ORDER BY name", conn
+            )
+            if people.empty:
+                st.write("No one added yet")
+            else:
+                st.dataframe(people, use_container_width=True, hide_index=True)
+        except Exception:
+            st.write("No people yet")
         conn.close()
 
     with tab_remove:
@@ -276,16 +287,19 @@ elif page == "History":
     st.title("History")
 
     conn = get_conn()
-    df = pd.read_sql_query("""
-        SELECT cy.name, cy.status,
-               COALESCE(SUM(cm.lbs),0) as lbs,
-               COALESCE(SUM(cm.amount_paid),0) as collected,
-               COALESCE(SUM(cm.lbs * cy.wholesale_price),0) as cost
-        FROM cycles cy
-        LEFT JOIN commitments cm ON cm.cycle_id = cy.id
-        GROUP BY cy.id
-        ORDER BY cy.id DESC
-    """, conn)
+    try:
+        df = pd.read_sql_query("""
+            SELECT cy.name, cy.status,
+                   COALESCE(SUM(cm.lbs),0) as lbs,
+                   COALESCE(SUM(cm.amount_paid),0) as collected,
+                   COALESCE(SUM(cm.lbs * cy.wholesale_price),0) as cost
+            FROM cycles cy
+            LEFT JOIN commitments cm ON cm.cycle_id = cy.id
+            GROUP BY cy.id
+            ORDER BY cy.id DESC
+        """, conn)
+    except Exception:
+        df = pd.DataFrame()
 
     if df.empty:
         st.write("No drops yet")
