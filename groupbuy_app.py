@@ -76,7 +76,8 @@ if page == "Dashboard":
     col4.metric("Reinvestment Fund", f"${reinvestment:,.0f}")
     st.markdown("---")
     if open_cycle:
-        st.subheader(f"Current Cycle: {open_cycle['name'] or f'Cycle #{open_cycle[\"id\"]}'}")
+        cycle_label = open_cycle["name"] if open_cycle["name"] else f"Cycle #{open_cycle['id']}"
+        st.subheader(f"Current Cycle: {cycle_label}")
         st.write(f"**Status:** {open_cycle['status']}  |  **Opened:** {open_cycle['opened_date'] or '—'}")
         commits = conn.execute("SELECT COALESCE(SUM(lbs), 0) as total_lbs, COALESCE(SUM(amount_due), 0) as total_due, COALESCE(SUM(amount_paid), 0) as total_paid, COUNT(*) as num_people FROM commitments WHERE cycle_id = ?", (open_cycle["id"],)).fetchone()
         c1, c2, c3, c4 = st.columns(4)
